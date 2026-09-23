@@ -3,6 +3,7 @@
 端点：
     POST /paths               写入 SVG path 数据及填充规则
     POST /paths/{id}/normalize 按轮廓包含层级分类外环/孔洞并重写方向
+    POST /paths/{id}/clearance 轮廓间安全间隙校验（即时规范化，不写库）
     POST /paths/compare        两条已存路径的版本差异审计（指纹匹配 + 三类变更）
     GET  /paths/{id}          查询原始路径、规范化结果及边界警告
     GET  /healthz             存活/就绪探针
@@ -19,6 +20,7 @@ from pydantic import BaseModel, Field
 from sqlite3 import Connection
 
 from . import db
+from .clearance import check_clearance
 from .diff import compare_normalized
 from .svggeo import SVGPathError, normalize_path
 
@@ -31,9 +33,9 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SVG 轮廓规范化 API",
-    version="1.1.0",
+    version="1.2.0",
     description="写入 SVG path，按包含层级分类外环/孔洞并重写绕向，"
-                "并支持两条已存路径的版本差异审计。",
+                "支持轮廓间安全间隙校验与两条已存路径的版本差异审计。",
     lifespan=lifespan,
 )
 
@@ -60,6 +62,13 @@ class PathIn(BaseModel):
 class CompareIn(BaseModel):
     base_id: int = Field(..., gt=0, description="基线路径 id")
     candidate_id: int = Field(..., gt=0, description="候选（新版本）路径 id")
+
+
+class ClearanceIn(BaseModel):
+    min_distance: float = Field(..., gt=0, allow_inf_nan=False,
+                                description="最小安全间隙阈值，必须为正数")
+    include_open: bool = Field(
+        False, description="是否将开放轮廓纳入校验（退化轮廓始终跳过）")
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +205,21 @@ def normalize(path_id: int,
         "fill_rule": row["fill_rule"],
         "normalized": {"d": normalized_d, **result},
     }
+
+
+@app.post("/paths/{path_id}/clearance")
+def clearance(path_id: int, payload: ClearanceIn,
+              conn: Connection = Depends(get_db)) -> dict[str, Any]:
+    row = _get_row(conn, path_id)
+    # 即时规范化 + 纯几何计算：不写库（已存路径在写入时已校验，
+    # 此处防御性处理损坏/历史脏数据 -> 422）
+    try:
+        result = check_clearance(row["d"], row["fill_rule"],
+                                 payload.min_distance, payload.include_open)
+    except SVGPathError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"SVG path 规范化失败: {exc}")
+    return {"id": path_id, **result}
 
 
 @app.get("/paths/{path_id}")

@@ -280,3 +280,98 @@ def test_compare_422_when_stored_path_unparseable(client):
     r = client.post("/paths/compare", json={"base_id": good, "candidate_id": bad_id})
     assert r.status_code == 422
     assert "candidate_id" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/clearance 轮廓间安全间隙校验
+# ---------------------------------------------------------------------------
+
+def test_clearance_hole_parent_conflict(client):
+    pid = _mk(client, "M0,0h40v40h-40Z M10,10h20v20h-20Z")  # 壁厚 10
+    r = client.post(f"/paths/{pid}/clearance", json={"min_distance": 15})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["min_distance"] == 15.0
+    assert body["include_open"] is False
+    assert len(body["conflicts"]) == 1
+    c = body["conflicts"][0]
+    assert c["a_original_index"] == 0 and c["a_role"] == "outer"
+    assert c["b_original_index"] == 1 and c["b_role"] == "hole"
+    assert c["distance"] == 10.0
+    assert c["threshold"] == 15.0
+    assert c["hole_parent_pair"] is True
+    assert body["summary"] == {"contours_total": 2, "contours_checked": 2,
+                               "pairs_checked": 1, "conflict_count": 1}
+
+
+def test_clearance_equal_threshold_passes(client):
+    pid = _mk(client, "M0,0h40v40h-40Z M10,10h20v20h-20Z")
+    body = client.post(f"/paths/{pid}/clearance",
+                       json={"min_distance": 10}).json()
+    assert body["conflicts"] == []
+    assert body["summary"]["conflict_count"] == 0
+
+
+def test_clearance_conflicts_sorted_by_original_index(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M12,0h10v10h-10Z M24,0h10v10h-10Z")
+    body = client.post(f"/paths/{pid}/clearance",
+                       json={"min_distance": 3}).json()
+    pairs = [(c["a_original_index"], c["b_original_index"])
+             for c in body["conflicts"]]
+    assert pairs == [(0, 1), (1, 2)]
+    assert all(c["distance"] == 2.0 for c in body["conflicts"])
+    assert all(c["hole_parent_pair"] is False for c in body["conflicts"])
+
+
+def test_clearance_open_contour_opt_in(client):
+    pid = _mk(client, "M0,0h40v40h-40Z M5,5 L35,5 L35,35")
+    # 默认跳过开放轮廓
+    body = client.post(f"/paths/{pid}/clearance",
+                       json={"min_distance": 10}).json()
+    assert body["conflicts"] == []
+    assert body["summary"]["contours_checked"] == 1
+    # include_open=true 后开放轮廓参与校验
+    body = client.post(f"/paths/{pid}/clearance",
+                       json={"min_distance": 10, "include_open": True}).json()
+    assert body["include_open"] is True
+    assert len(body["conflicts"]) == 1
+    assert body["conflicts"][0]["b_role"] == "open"
+    assert body["conflicts"][0]["distance"] == 5.0
+
+
+def test_clearance_deterministic_and_no_db_write(client):
+    pid = _mk(client, "M0,0h40v40h-40Z M10,10h20v20h-20Z")
+    r1 = client.post(f"/paths/{pid}/clearance", json={"min_distance": 15}).json()
+    r2 = client.post(f"/paths/{pid}/clearance", json={"min_distance": 15}).json()
+    assert r1 == r2
+    # 纯计算：不落库、不产生 normalized 结果
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+
+
+def test_clearance_404(client):
+    r = client.post("/paths/999999/clearance", json={"min_distance": 5})
+    assert r.status_code == 404
+
+
+def test_clearance_422_on_invalid_params(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    assert client.post(f"/paths/{pid}/clearance",
+                       json={"min_distance": 0}).status_code == 422
+    assert client.post(f"/paths/{pid}/clearance",
+                       json={"min_distance": -3}).status_code == 422
+    assert client.post(f"/paths/{pid}/clearance", json={}).status_code == 422
+    assert client.post(f"/paths/{pid}/clearance",
+                       json={"min_distance": "x"}).status_code == 422
+
+
+def test_clearance_422_when_stored_path_unparseable(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/clearance", json={"min_distance": 5})
+    assert r.status_code == 422

@@ -3,8 +3,10 @@
 基于 **FastAPI + SQLite + Docker** 的服务：接收 SVG `path` 数据与填充规则，
 按轮廓之间的**包含层级**把每个子路径分类为**外环 / 孔洞（可嵌套出“岛”）**，
 并重写绘制方向（外环顺时针、孔洞逆时针），同时保留轮廓层级、原始索引与自定义元数据，
-对边界情况给出明确警告；另提供 **`POST /paths/compare` 版本差异审计**，按几何指纹
-稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，可直接调用。
+对边界情况给出明确警告；另提供 **`POST /paths/{id}/clearance` 轮廓间安全间隙校验**
+（按细分折线计算两两轮廓边界最小距离，报告小于阈值的冲突对）与
+**`POST /paths/compare` 版本差异审计**（按几何指纹稳定匹配两条已存路径并给出
+added / removed / modified 三组差异）。启动后自动建表，可直接调用。
 
 ## 目录结构
 
@@ -15,8 +17,9 @@
 │   ├── main.py        # FastAPI 路由、模型、启动自动初始化
 │   ├── db.py          # SQLite 连接与幂等建表
 │   ├── svggeo.py      # SVG path 解析 / 细分 / 包含层级 / 方向重写 / 几何指纹（零三方依赖）
+│   ├── clearance.py   # 安全间隙校验：细分折线的轮廓边界最小距离（零三方依赖）
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（50 个）
+├── tests/             # pytest 单元 + API 端到端测试（74 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -111,6 +114,61 @@ curl -s -X POST localhost:8000/paths/1/normalize
 | `bounds` | `minx/miny/maxx/maxy` 包围盒 |
 | `reversed` | 本次是否重写了方向 |
 | `metadata` | 创建时按索引提交的自定义元数据 |
+
+### `POST /paths/{id}/clearance` — 轮廓间安全间隙校验
+
+对路径**即时规范化**（只读：无需事先调用 normalize，也不会写库），按**细分后的
+折线**计算任意两轮廓**边界之间的最小欧氏距离**，报告距离小于阈值的冲突对。
+
+- 参与对象：闭合非退化轮廓（`outer` / `hole`）；`include_open=true` 时开放轮廓
+  （`open`，按未闭合折线计）一并参与；**退化轮廓始终跳过**，同一轮廓不与自身比较；
+- 距离为两轮廓细分线段集合的最小线段-线段距离，边界相交/相接时为 `0`；
+- **距离等于阈值视为通过**：距离量化到 1e-9 后与 `min_distance` 严格比较（`<` 才算
+  冲突），相同输入必然得到相同输出（确定性）；
+- 孔洞与其**直接父轮廓**的间隙（即壁厚）以 `hole_parent_pair=true` 标记。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `min_distance` | number | 最小安全间隙阈值，必须 `> 0`（必填） |
+| `include_open` | bool | 是否将开放轮廓纳入校验，默认 `false` |
+
+```bash
+curl -s -X POST localhost:8000/paths/1/clearance \
+  -H 'Content-Type: application/json' \
+  -d '{"min_distance": 15, "include_open": false}'
+```
+
+响应（`conflicts` 按 `(a_original_index, b_original_index)` 升序）：
+
+```json
+{
+  "id": 1,
+  "min_distance": 15.0,
+  "include_open": false,
+  "conflicts": [
+    {
+      "a_original_index": 0,
+      "a_role": "outer",
+      "b_original_index": 1,
+      "b_role": "hole",
+      "distance": 10.0,
+      "threshold": 15.0,
+      "hole_parent_pair": true
+    }
+  ],
+  "summary": {
+    "contours_total": 2,
+    "contours_checked": 2,
+    "pairs_checked": 1,
+    "conflict_count": 1
+  }
+}
+```
+
+路径不存在返回 `404`；`min_distance` 缺失/非正数/非数值或已存路径无法规范化
+返回 `422`。
 
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
@@ -257,14 +315,16 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 50 passed
+pytest -q          # 74 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
 开放与退化轮廓、元数据保留、完整 API 生命周期、404/422、重复规范化幂等；
 几何指纹的起点/方向不变性、闭合区分、量化噪声吸收；版本审计的仅方向变化、
 层级变化、几何变化、子路径重排（同指纹索引变化）、全等重复轮廓就近配对、
-added/removed、元数据透传、未规范化即时审计与脏数据 422 等。
+added/removed、元数据透传、未规范化即时审计与脏数据 422；安全间隙校验的
+线段/边界距离、孔-父壁厚标记、同级孔间距、阈值等于距离通过、开放轮廓 opt-in、
+退化轮廓跳过、冲突对排序与确定性、不写库等。
 
 ## 数据存储
 
