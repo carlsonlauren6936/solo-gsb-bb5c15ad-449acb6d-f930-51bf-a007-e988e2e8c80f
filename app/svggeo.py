@@ -396,6 +396,72 @@ def _on_segment(a, b, p, eps) -> bool:
             and min(a[1], b[1]) - eps <= p[1] <= max(a[1], b[1]) + eps)
 
 
+def point_segment_dist2(p: tuple[float, float],
+                        a: tuple[float, float],
+                        b: tuple[float, float]) -> float:
+    """点 ``p`` 到线段 ``ab`` 的平方距离（自动处理 a==b 的零长度段）。"""
+    abx, aby = b[0] - a[0], b[1] - a[1]
+    apx, apy = p[0] - a[0], p[1] - a[1]
+    denom = abx * abx + aby * aby
+    if denom == 0.0:
+        return apx * apx + apy * apy
+    t = (apx * abx + apy * aby) / denom
+    if t <= 0.0:
+        cx, cy = a
+    elif t >= 1.0:
+        cx, cy = b
+    else:
+        cx, cy = a[0] + t * abx, a[1] + t * aby
+    dx, dy = p[0] - cx, p[1] - cy
+    return dx * dx + dy * dy
+
+
+def segment_segment_dist2(a: tuple[float, float],
+                          b: tuple[float, float],
+                          c: tuple[float, float],
+                          d: tuple[float, float]) -> float:
+    """两线段间的最小平方欧氏距离。
+
+    先按参数方程求解内点最近对（线段相交时距离为 0），
+    无解时退化为四个端点-线段距离的最小值；天然兼容零长度段。
+    """
+    ux, uy = b[0] - a[0], b[1] - a[1]
+    vx, vy = d[0] - c[0], d[1] - c[1]
+    wx, wy = a[0] - c[0], a[1] - c[1]
+    uu = ux * ux + uy * uy
+    vv = vx * vx + vy * vy
+    uv = ux * vx + uy * vy
+    uw = ux * wx + uy * wy
+    vw = vx * wx + vy * wy
+    denom = uu * vv - uv * uv
+
+    s, t = 0.0, 0.0
+    parallel = False
+    if denom != 0.0:
+        s = (uv * vw - vv * uw) / denom
+        if 0.0 <= s <= 1.0:
+            t = (uv * s + vw) / vv if vv != 0.0 else 0.0
+            if not (0.0 <= t <= 1.0):
+                parallel = True
+        else:
+            parallel = True
+    else:
+        parallel = True
+
+    if parallel:
+        # 解不在两线段内部：最小值一定落在端点到另一线段的距离上
+        return min(point_segment_dist2(a, c, d),
+                   point_segment_dist2(b, c, d),
+                   point_segment_dist2(c, a, b),
+                   point_segment_dist2(d, a, b))
+
+    cx, cy = a[0] + s * ux, a[1] + s * uy
+    ex, ey = c[0] + t * vx, c[1] + t * vy
+    dx, dy = cx - ex, cy - ey
+    return dx * dx + dy * dy
+
+
+
 # ---------------------------------------------------------------------------
 # 几何指纹：版本差异审计中跨版本稳定地识别“同一轮廓”
 # ---------------------------------------------------------------------------
@@ -612,24 +678,14 @@ class Contour:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def normalize_path(d: str, fill_rule: str,
+def build_contours(d: str,
                    contour_metadata: list[dict[str, Any]] | None = None
-                   ) -> dict[str, Any]:
-    """规范化入口。
+                   ) -> list[Contour]:
+    """解析 ``d`` 并构造轮廓列表（细分、面积/包围盒、退化判定、指纹）。
 
-    参数:
-        d: 原始 SVG path 数据
-        fill_rule: ``nonzero`` 或 ``evenodd``
-        contour_metadata: 按原始子路径索引提供的自定义元数据（可选）
-
-    返回:
-        ``{normalized_d, fill_rule, contours, warnings}``
+    不做包含层级分类与方向重写。
     """
-    if fill_rule not in ("nonzero", "evenodd"):
-        raise SVGPathError("fill_rule 必须是 'nonzero' 或 'evenodd'")
-
     subs = parse_path(d)
-    warnings: list[dict[str, Any]] = []
     contours: list[Contour] = []
 
     for idx, sub in enumerate(subs):
@@ -651,10 +707,16 @@ def normalize_path(d: str, fill_rule: str,
             if contour_metadata and idx < len(contour_metadata) else {},
         ))
 
-    if not contours:
-        warnings.append({"code": "EMPTY_PATH",
-                         "contour_original_index": None,
-                         "message": "path 数据为空或不包含任何子路径"})
+    return contours
+
+
+def classify_contours(contours: list[Contour]) -> list[dict[str, Any]]:
+    """按包含层级把轮廓分类为 outer / hole，其余标记 open / degenerate。
+
+    直接就地更新 ``Contour.role / depth / parent_original_index``，
+    返回层级/退化相关警告（不含 EMPTY_PATH 与 NONZERO_DIR_CONFLICT）。
+    """
+    warnings: list[dict[str, Any]] = []
 
     # ---- 层级分类 ---------------------------------------------------------
     # 仅闭合且非退化轮廓参与包含层级；按面积由大到小处理，
@@ -711,7 +773,7 @@ def normalize_path(d: str, fill_rule: str,
             node = next(v for v in valid
                         if v.original_index == node.parent_original_index)
 
-    # ---- 警告 -------------------------------------------------------------
+    # ---- open / degenerate 标记与警告 -------------------------------------
     for c in contours:
         if not c.closed and not c.degenerate:
             c.role = "open"
@@ -727,6 +789,45 @@ def normalize_path(d: str, fill_rule: str,
                 "contour_original_index": c.original_index,
                 "message": "轮廓面积为 0 或顶点不足，跳过方向重写"})
 
+    return warnings
+
+
+def analyze_contours(d: str, fill_rule: str,
+                     contour_metadata: list[dict[str, Any]] | None = None
+                     ) -> tuple[list[Contour], list[dict[str, Any]]]:
+    """解析并完成轮廓层级分类（不重写方向、不序列化）。
+
+    供规范化主流程与轮廓间安全间隙校验共用。
+    返回 ``(contours, warnings)``；空路径产生一条 EMPTY_PATH 警告。
+    """
+    if fill_rule not in ("nonzero", "evenodd"):
+        raise SVGPathError("fill_rule 必须是 'nonzero' 或 'evenodd'")
+
+    contours = build_contours(d, contour_metadata)
+    warnings = classify_contours(contours)
+    if not contours:
+        warnings.append({"code": "EMPTY_PATH",
+                         "contour_original_index": None,
+                         "message": "path 数据为空或不包含任何子路径"})
+    return contours, warnings
+
+
+def normalize_path(d: str, fill_rule: str,
+                   contour_metadata: list[dict[str, Any]] | None = None
+                   ) -> dict[str, Any]:
+    """规范化入口。
+
+    参数:
+        d: 原始 SVG path 数据
+        fill_rule: ``nonzero`` 或 ``evenodd``
+        contour_metadata: 按原始子路径索引提供的自定义元数据（可选）
+
+    返回:
+        ``{normalized_d, fill_rule, contours, warnings}``
+    """
+    contours, warnings = analyze_contours(d, fill_rule, contour_metadata)
+
+    valid = [c for c in contours if c.role in ("outer", "hole")]
     if fill_rule == "nonzero":
         for c in valid:
             if c.role == "outer" and c.area < 0:

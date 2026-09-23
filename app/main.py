@@ -1,26 +1,31 @@
 """SVG 轮廓规范化 API。
 
 端点：
-    POST /paths               写入 SVG path 数据及填充规则
-    POST /paths/{id}/normalize 按轮廓包含层级分类外环/孔洞并重写方向
-    POST /paths/compare        两条已存路径的版本差异审计（指纹匹配 + 三类变更）
-    GET  /paths/{id}          查询原始路径、规范化结果及边界警告
-    GET  /healthz             存活/就绪探针
+    POST /paths                  写入 SVG path 数据及填充规则
+    POST /paths/{id}/normalize   按轮廓包含层级分类外环/孔洞并重写方向
+    POST /paths/{id}/clearance   轮廓间安全间隙（最小欧氏距离）即时校验
+    POST /paths/compare          两条已存路径的版本差异审计（指纹匹配 + 三类变更）
+    GET  /paths/{id}             查询原始路径、规范化结果及边界警告
+    GET  /healthz                存活/就绪探针
 """
 
 from __future__ import annotations
 
 import json
+import math
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, status
-from pydantic import BaseModel, Field
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
 from sqlite3 import Connection
 
 from . import db
+from .clearance import check_clearance
 from .diff import compare_normalized
-from .svggeo import SVGPathError, normalize_path
+from .svggeo import SVGPathError, analyze_contours, normalize_path
 
 
 @asynccontextmanager
@@ -31,11 +36,33 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SVG 轮廓规范化 API",
-    version="1.1.0",
+    version="1.2.0",
     description="写入 SVG path，按包含层级分类外环/孔洞并重写绕向，"
-                "并支持两条已存路径的版本差异审计。",
+                "支持轮廓间安全间隙校验与两条已存路径的版本差异审计。",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(_request: Request,
+                                        exc: RequestValidationError) -> JSONResponse:
+    """422 处理器：净化 NaN/Infinity 等非合法 JSON 回显值（如 1e999）。"""
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": _json_safe(exc.errors())},
+    )
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return "non-finite"
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, BaseException):
+        return str(value)
+    return value
 
 
 def get_db() -> Connection:
@@ -60,6 +87,20 @@ class PathIn(BaseModel):
 class CompareIn(BaseModel):
     base_id: int = Field(..., gt=0, description="基线路径 id")
     candidate_id: int = Field(..., gt=0, description="候选（新版本）路径 id")
+
+
+class ClearanceIn(BaseModel):
+    min_distance: float = Field(..., gt=0,
+                                description="允许的最小轮廓间欧氏距离（>0）；等于该值视为通过")
+    include_open: bool = Field(False,
+                               description="是否把未闭合的开放轮廓按折线纳入校验")
+
+    @field_validator("min_distance")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("min_distance 必须是有限数值")
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +177,15 @@ def _normalize_row(row) -> dict[str, Any]:
     )
 
 
+def _analyze_row(row):
+    """对已落库行即时解析并完成轮廓层级分类（只读，不写库）。"""
+    contour_meta = json.loads(row["contour_metadata"] or "[]")
+    return analyze_contours(
+        row["d"], row["fill_rule"],
+        contour_metadata=contour_meta if contour_meta else None,
+    )
+
+
 @app.post("/paths/compare")
 def compare_paths(payload: CompareIn,
                   conn: Connection = Depends(get_db)) -> dict[str, Any]:
@@ -201,3 +251,22 @@ def normalize(path_id: int,
 @app.get("/paths/{path_id}")
 def get_path(path_id: int, conn: Connection = Depends(get_db)) -> dict[str, Any]:
     return _row_to_dict(_get_row(conn, path_id))
+
+
+@app.post("/paths/{path_id}/clearance")
+def clearance(path_id: int,
+              payload: ClearanceIn,
+              conn: Connection = Depends(get_db)) -> dict[str, Any]:
+    row = _get_row(conn, path_id)
+
+    # 即时解析/分类：不依赖已保存的规范化结果，也不写库
+    try:
+        contours, _warnings = _analyze_row(row)
+    except SVGPathError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"SVG path 无法规范化: {exc}")
+
+    result = check_clearance(contours,
+                             min_distance=payload.min_distance,
+                             include_open=payload.include_open)
+    return {"id": path_id, **result}
